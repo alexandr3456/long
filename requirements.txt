@@ -1,6 +1,6 @@
-pandas-ta-classic
+pandas_ta_classic
 pandas
 ccxt
 aiogram==3.*
 apscheduler
-python-dotenv
+python_dotenv
