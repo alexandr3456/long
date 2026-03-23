@@ -4,7 +4,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import ccxt
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
