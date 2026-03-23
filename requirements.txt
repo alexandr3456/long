@@ -1,0 +1,6 @@
+pandas-ta-classic
+pandas
+ccxt
+aiogram==3.*
+apscheduler
+python-dotenv
