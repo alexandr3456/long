@@ -77,52 +77,93 @@ async def handle_all(message: Message):
     else:
         await message.answer("Бот работает 👍\n/start — подписаться на LONG сигналы")
 
-# ===================== CORE =====================
+
+# ===================== INDICATORS & STRATEGY =====================
 def calculate_indicators(df):
-    df["rsi"] = ta.rsi(df["close"], length=14)
+    df["rsi"] = ta.rsi(df["close"], length=18)
     df["ema50"] = ta.ema(df["close"], length=50)
+    df["ema200"] = ta.ema(df["close"], length=200)
+    df["ema_dist"] = df["close"] / df["ema50"] - 1
+    df["volume_ma"] = df["volume"].rolling(20).mean()
+    df["volume_ratio"] = df["volume"] / df["volume_ma"]
     return df
 
+
 def get_signal(df, funding_rate, open_interest):
+    """
+    Логика стратегии:
+    - Тренд: price > EMA200
+    - Отскок: RSI < 40 или в зоне 40–55 после роста за 20 свечей
+    - Импульс объёма: >1.8× среднего
+    - Цена чуть ниже EMA50 (дисконт)
+    - Последняя свеча зелёная
+    - Фандинг не слишком негативный
+    - Есть открытый интерес
+    """
     price = df["close"].iloc[-1]
-    ema = df["ema50"].iloc[-1]
+    ema50 = df["ema50"].iloc[-1]
+    ema200 = df["ema200"].iloc[-1]
     rsi = df["rsi"].iloc[-1]
-    
-    price_change = (df["close"].iloc[-1] / df["close"].iloc[-4] - 1) * 100
-    avg_vol = df["volume"].rolling(20).mean().iloc[-2]
-    cur_vol = df["volume"].iloc[-1]
-    volume_spike = cur_vol > avg_vol * 1.8 if avg_vol > 0 else False
-    
-    far_from_ema = price < ema * 0.96 if ema else False   # цена значительно ниже EMA
+    volume_ratio = df["volume_ratio"].iloc[-1]
+
+    # 1. Трендовый фильтр: только long в восходящем тренде
+    in_uptrend = price > ema200 if ema200 else False
+
+    # 2. Рост за 20 свечей (примерно 100 минут на 5m)
+    base_price = df["close"].iloc[-21] if len(df) >= 21 else df["close"].iloc[0]
+    price_change_20 = (price / base_price - 1) * 100
+
+    # 3. RSI: не покупка на силе, а отскок
+    rsi_ok = rsi < 40 or (40 <= rsi < 55)
+
+    # 4. Импульс объёма
+    volume_spike = volume_ratio > 1.8 if volume_ratio > 0 else False
+
+    # 5. Цена ниже EMA50, но не коллапс
+    far_from_ema = price < ema50 * 0.97 and price > ema50 * 0.90 if ema50 else False
+
+    # 6. Последняя свеча зелёная
     last_green = df["close"].iloc[-1] > df["open"].iloc[-1]
 
+    # 7. Фандинг: не сверх‑негативный
+    funding_ok = funding_rate > -0.01
+
+    # 8. Open Interest: есть интерес
+    oi_ok = open_interest > 0
+
+    # Счётчик качества сигнала
     score = 0
-    if price_change > 3:
+    if in_uptrend:
         score += 2
-    if rsi < 40 or (rsi > 45 and rsi < 55):   # выход из перепроданности
-        score += 2
+    if price_change_20 > 3 and rsi_ok:
+        score += 3
     if volume_spike:
         score += 2
     if far_from_ema:
         score += 2
     if last_green:
         score += 1
-    if funding_rate > 0.01:          # положительный funding = бычий настрой
+    if funding_ok:
         score += 1
-    if open_interest > 0:
+    if oi_ok:
         score += 1
 
-    return score, {
-        "price_change": price_change,
+    meta = {
+        "price_change_20": price_change_20,
         "rsi": rsi,
-        "volume_ratio": (cur_vol / avg_vol) if avg_vol else 0,
-        "ema_distance": ((price / ema - 1) * 100) if ema else 0,
+        "volume_ratio": volume_ratio,
+        "ema_dist_50": ((price / ema50 - 1) * 100) if ema50 else 0,
+        "ema_dist_200": ((price / ema200 - 1) * 100) if ema200 else 0,
         "funding": funding_rate,
-        "oi": open_interest
+        "oi": open_interest,
     }
 
-# (fetch_ohlcv_async, fetch_funding, fetch_oi, process_symbol — оставил почти без изменений)
+    if score >= 8:
+        return score, meta
+    return 0, meta
 
+
+# ===================== FETCH HELPERS =====================
 async def fetch_ohlcv_async(symbol):
     try:
         return await asyncio.to_thread(
@@ -136,6 +177,7 @@ async def fetch_ohlcv_async(symbol):
         logger.error(f"fetch_ohlcv_async error for {symbol}: {e}")
         return []
 
+
 async def fetch_funding(symbol):
     try:
         data = await asyncio.to_thread(exchange.fetch_funding_rate, symbol)
@@ -144,14 +186,21 @@ async def fetch_funding(symbol):
         logger.error(f"fetch_funding error for {symbol}: {e}")
         return 0
 
+
 async def fetch_oi(symbol):
     try:
-        data = await asyncio.to_thread(exchange.fetch_open_interest, symbol, params={"category": "linear"})
+        data = await asyncio.to_thread(
+            exchange.fetch_open_interest,
+            symbol,
+            params={"category": "linear"}
+        )
         return float(data.get("openInterest", 0))
     except Exception as e:
         logger.error(f"fetch_oi error for {symbol}: {e}")
         return 0
 
+
+# ===================== CORE SCAN =====================
 async def process_symbol(symbol):
     try:
         now = datetime.now()
@@ -159,25 +208,30 @@ async def process_symbol(symbol):
             return None
 
         ohlcv = await fetch_ohlcv_async(symbol)
-        if not ohlcv or len(ohlcv) < 20:
+        if not ohlcv or len(ohlcv) < 50:  # нужно 50+ для ema200
             return None
 
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df["close"] = pd.to_numeric(df["close"], errors='coerce')
-        df["volume"] = pd.to_numeric(df["volume"], errors='coerce')
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
         df = calculate_indicators(df)
+
+        # Пропускаем, если нет EMA200 рассчитанной
+        if "ema200" not in df or df["ema200"].iloc[-10:].isna().all():
+            return None
 
         funding = await fetch_funding(symbol)
         oi = await fetch_oi(symbol)
 
         score, data = get_signal(df, funding, oi)
 
-        if score >= 7:
+        if score >= 8:
             last_signals[symbol] = now
             return symbol, score, data
     except Exception as e:
         logger.error(f"process_symbol error for {symbol}: {e}")
     return None
+
 
 async def scan_market():
     logger.info("🔍 LONG Scan started")
@@ -188,7 +242,7 @@ async def scan_market():
             if i.get("linear") and i.get("quote") == "USDT" and i.get("active", True)
         ]
 
-        tasks = [process_symbol(s) for s in symbols[:100]]   # можно увеличить
+        tasks = [process_symbol(s) for s in symbols[:100]]  # можно увеличить
         results = await asyncio.gather(*tasks)
         signals = [r for r in results if r]
 
@@ -196,11 +250,12 @@ async def scan_market():
             token = symbol.replace("USDT", "").replace(":", "")
             text = f"""
 🚀 <b>LONG SIGNAL</b> — ${token}
-🔥 Score: <b>{score}/10</b>
-📈 Рост: {d['price_change']:.2f}%
+🔥 Score: <b>{score}/13</b>
+📈 Рост за 20 свечей: {d['price_change_20']:.2f}%
 📉 RSI: {d['rsi']:.1f}
-📊 Volume: x{d['volume_ratio']:.1f}
-📐 EMA dist: {d['ema_distance']:.1f}%
+📊 Volume ratio: x{d['volume_ratio']:.1f}
+📐 EMA50 dist: {d['ema_dist_50']:.1f}%
+📐 EMA200 dist: {d['ema_dist_200']:.1f}%
 💰 Funding: {d['funding']:.4f}%
 📊 OI: {d['oi']:.0f}
 🕒 {datetime.now().strftime('%H:%M:%S')}
@@ -209,7 +264,12 @@ async def scan_market():
 
             for user in list(subscribers):
                 try:
-                    await bot.send_message(user, text, parse_mode="HTML", disable_web_page_preview=True)
+                    await bot.send_message(
+                        user,
+                        text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to send to {user}: {e}")
                     if "chat not found" in str(e).lower():
@@ -218,6 +278,7 @@ async def scan_market():
         logger.info(f"✅ LONG signals sent: {len(signals)}")
     except Exception as e:
         logger.error(f"Scan error: {e}")
+
 
 # ===================== MAIN =====================
 async def main():
@@ -232,9 +293,11 @@ async def main():
     async def delayed_scan():
         await asyncio.sleep(3)
         await scan_market()
+
     asyncio.create_task(delayed_scan())
 
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
